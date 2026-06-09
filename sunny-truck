@@ -30,7 +30,9 @@ local lastPosition = nil
 local farmHeartbeat = nil
 local currentFarmNPC = nil
 
+-- UI Component References
 local AutoFarmToggle
+local ModeDropdown
 local TargetDropdown
 local FriendlyDropdown
 
@@ -56,6 +58,11 @@ local function DisconnectAll()
         if conn.Connected then conn:Disconnect() end
     end
     table.clear(Connections)
+    
+    if farmHeartbeat then
+        farmHeartbeat:Disconnect()
+        farmHeartbeat = nil
+    end
 end
 
 local function GetRootPart()
@@ -63,7 +70,6 @@ local function GetRootPart()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
--- Updated TeleportTo function supporting Tween and Instant methods
 local function TeleportTo(targetCFrame, yOffset)
     local rootPart = GetRootPart()
     if not rootPart then return false end
@@ -75,15 +81,16 @@ local function TeleportTo(targetCFrame, yOffset)
         local tweenInfo = TweenInfo.new(Flags.TweenSpeed, Enum.EasingStyle.Linear)
         local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = finalCFrame})
         tween:Play()
-        tween.Completed:Wait() -- Wait for tween to finish
+        tween.Completed:Wait()
     else
         rootPart.CFrame = finalCFrame
         task.wait(0.15)
     end
     
-    -- Resetting velocities preventing rubberbanding
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
+    if rootPart and rootPart.Parent then
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+    end
     return true
 end
 
@@ -156,15 +163,50 @@ table.insert(Connections, Workspace.ChildAdded:Connect(function(child)
     if child.Name == "NPCs" then task.wait(1); refreshDropdownContents() end
 end))
 
--- Click to Teleport Connection
+-- Refactored Click to Auto Farm Connection
 table.insert(Connections, Mouse.Button1Down:Connect(function()
-    if Flags.ClickTeleport then
-        local target = Mouse.Target
-        if target and target.Parent then
-            local humanoid = target.Parent:FindFirstChildWhichIsA("Humanoid")
-            local targetRoot = target.Parent:FindFirstChild("HumanoidRootPart")
-            if humanoid and targetRoot then
-                TeleportTo(targetRoot.CFrame, 0)
+    if not Flags.ClickTeleport then return end
+    
+    local target = Mouse.Target
+    local model = target and target:FindFirstAncestorOfClass("Model")
+    if not model then return end
+    
+    local humanoid = model:FindFirstChildWhichIsA("Humanoid")
+    local targetRoot = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
+    
+    if humanoid and humanoid.Health > 0 and targetRoot then
+        local clickedPlayer = Players:GetPlayerFromCharacter(model)
+        
+        if clickedPlayer then
+            if clickedPlayer == LocalPlayer then return end
+            
+            targetMode = "Player"
+            selectedTarget = clickedPlayer.Name
+            currentFarmNPC = nil
+            
+            if ModeDropdown then ModeDropdown:SetValue("Player") end
+            if TargetDropdown then TargetDropdown:SetValue(clickedPlayer.Name) end
+            if AutoFarmToggle then AutoFarmToggle:SetValue(true) end
+        else
+            local hostileFolder = Workspace:FindFirstChild("NPCs") and Workspace.NPCs:FindFirstChild("Hostile")
+            if hostileFolder and model.Parent == hostileFolder then
+                targetMode = "NPC"
+                currentFarmNPC = model
+                
+                local nameCounts = {}
+                local displayName = model.Name
+                for _, npc in ipairs(hostileFolder:GetChildren()) do
+                    nameCounts[npc.Name] = (nameCounts[npc.Name] or 0) + 1
+                    if npc == model then
+                        displayName = npc.Name .. " #" .. nameCounts[npc.Name]
+                        break
+                    end
+                end
+                
+                selectedTarget = displayName
+                if ModeDropdown then ModeDropdown:SetValue("NPC") end
+                if TargetDropdown then TargetDropdown:SetValue(displayName) end
+                if AutoFarmToggle then AutoFarmToggle:SetValue(true) end
             end
         end
     end
@@ -265,7 +307,7 @@ Tabs.Interact:AddToggle("AutoChestToggle", {
 
 -- /// COMBAT TAB ///
 
-Tabs.Combat:AddDropdown("ModeDropdown", {
+ModeDropdown = Tabs.Combat:AddDropdown("ModeDropdown", {
     Title = "Target Mode",
     Values = {"NPC", "Player"},
     Multi = false,
@@ -318,6 +360,11 @@ AutoFarmToggle = Tabs.Combat:AddToggle("AutoFarmToggle", {
     Callback = function(state)
         Flags.AutoFarm = state
         
+        if farmHeartbeat then
+            farmHeartbeat:Disconnect()
+            farmHeartbeat = nil
+        end
+
         if Flags.AutoFarm then
             if selectedTarget == "Select Target" or selectedTarget == nil then
                 Fluent:Notify({ Title = "Auto Farm Error", Content = "Please select a Target first!", Duration = 5 })
@@ -366,21 +413,13 @@ AutoFarmToggle = Tabs.Combat:AddToggle("AutoFarmToggle", {
                 end
                 
                 if targetRoot and targetHumanoid and targetHumanoid.Health > 0 then
-                    -- Direct CFrame setting during loops to prevent bouncing, tweening is only for singular travels
                     local behindCFrame = targetRoot.CFrame * CFrame.new(0, 0, farmDistance)
                     root.CFrame = CFrame.lookAt(behindCFrame.Position, targetRoot.Position)
                     root.AssemblyLinearVelocity = Vector3.zero
                     root.AssemblyAngularVelocity = Vector3.zero
                 end
             end)
-            table.insert(Connections, farmHeartbeat)
-            
         else
-            if farmHeartbeat then
-                farmHeartbeat:Disconnect()
-                farmHeartbeat = nil
-            end
-            
             if lastPosition and ScriptRunning then
                 if Flags.ReturnToLastPos then
                     local character = LocalPlayer.Character
@@ -421,7 +460,7 @@ Tabs.Movement:AddSlider("TweenSlider", {
 })
 
 Tabs.Movement:AddToggle("ClickTeleport", {
-    Title = "Click Humanoid to Teleport",
+    Title = "Click Target to Auto Farm",
     Default = false,
     Callback = function(state)
         Flags.ClickTeleport = state
@@ -447,12 +486,10 @@ Tabs.Movement:AddButton({
         local npcRoot = npc and (npc:FindFirstChild("HumanoidRootPart") or npc:FindFirstChildWhichIsA("BasePart"))
         
         if npcRoot then
-            -- Find position 1 stud in front of NPC (Assuming Roblox default -Z is Forward)
             local frontCFrame = npcRoot.CFrame * CFrame.new(0, 0, -1)
             local playerStandPos = frontCFrame.Position
             local npcLookPos = npcRoot.Position
             
-            -- Keep Y coordinates level so character doesn't pitch downwards or upwards
             local targetCFrame = CFrame.lookAt(playerStandPos, Vector3.new(npcLookPos.X, playerStandPos.Y, npcLookPos.Z))
             TeleportTo(targetCFrame, 0)
         else
@@ -466,7 +503,7 @@ Tabs.Movement:AddButton({
 Tabs.Settings:AddInput("AutoExecUrl", {
     Title = "Auto Execute Script URL",
     Default = "",
-    Placeholder = "https://raw.githubusercontent.com/definitionful/jubilant-octo-spork/refs/heads/main/sunny-truck",
+    Placeholder = "Paste raw Loadstring URL here",
     Numeric = false,
     Finished = false,
     Callback = function(Value)
