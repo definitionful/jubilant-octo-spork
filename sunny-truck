@@ -466,7 +466,7 @@ Tabs.Movement:AddButton({
 Tabs.Settings:AddInput("AutoExecUrl", {
     Title = "Auto Execute Script URL",
     Default = "",
-    Placeholder = "Paste raw Loadstring URL here",
+    Placeholder = "https://raw.githubusercontent.com/definitionful/jubilant-octo-spork/refs/heads/main/sunny-truck",
     Numeric = false,
     Finished = false,
     Callback = function(Value)
