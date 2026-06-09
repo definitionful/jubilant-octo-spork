@@ -1,0 +1,528 @@
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+
+local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+
+local ScriptRunning = true
+local Connections = {}
+local Flags = {
+    AutoInteract = false,
+    AutoMeteorite = false,
+    AutoChest = false,
+    AutoFarm = false,
+    ClickTeleport = false,
+    TeleportMethod = "Instant",
+    TweenSpeed = 0.5,
+    ReturnToLastPos = true,
+    AutoExecute = false
+}
+
+local targetMode = "NPC"
+local selectedTarget = "Select Target"
+local selectedFriendly = "Select Friendly"
+local autoExecuteUrl = ""
+local farmDistance = 9
+local lastPosition = nil
+local farmHeartbeat = nil
+local currentFarmNPC = nil
+
+local AutoFarmToggle
+local TargetDropdown
+local FriendlyDropdown
+
+local Window = Fluent:CreateWindow({
+    Title = "Universal Farm Hub",
+    SubTitle = "Combined Hub",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(580, 480),
+    Acrylic = true,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.Delete
+})
+
+local Tabs = {
+    Interact = Window:AddTab({ Title = "Interact", Icon = "home" }),
+    Combat = Window:AddTab({ Title = "Combat", Icon = "swords" }),
+    Movement = Window:AddTab({ Title = "Movement", Icon = "navigation" }),
+    Settings = Window:AddTab({ Title = "Settings", Icon = "settings" })
+}
+
+local function DisconnectAll()
+    for _, conn in ipairs(Connections) do
+        if conn.Connected then conn:Disconnect() end
+    end
+    table.clear(Connections)
+end
+
+local function GetRootPart()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+-- Updated TeleportTo function supporting Tween and Instant methods
+local function TeleportTo(targetCFrame, yOffset)
+    local rootPart = GetRootPart()
+    if not rootPart then return false end
+    
+    yOffset = yOffset or 3
+    local finalCFrame = targetCFrame + Vector3.new(0, yOffset, 0)
+    
+    if Flags.TeleportMethod == "Tween" then
+        local tweenInfo = TweenInfo.new(Flags.TweenSpeed, Enum.EasingStyle.Linear)
+        local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = finalCFrame})
+        tween:Play()
+        tween.Completed:Wait() -- Wait for tween to finish
+    else
+        rootPart.CFrame = finalCFrame
+        task.wait(0.15)
+    end
+    
+    -- Resetting velocities preventing rubberbanding
+    rootPart.AssemblyLinearVelocity = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+    return true
+end
+
+local function getTargets()
+    local targets = {"Select Target"}
+    if targetMode == "NPC" then
+        local hostileFolder = Workspace:FindFirstChild("NPCs") and Workspace.NPCs:FindFirstChild("Hostile")
+        if hostileFolder then
+            local nameCounts = {}
+            for _, npc in ipairs(hostileFolder:GetChildren()) do
+                nameCounts[npc.Name] = (nameCounts[npc.Name] or 0) + 1
+                local displayName = npc.Name .. " #" .. nameCounts[npc.Name]
+                table.insert(targets, displayName)
+            end
+        end
+    elseif targetMode == "Player" then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                table.insert(targets, player.Name)
+            end
+        end
+    end
+    return targets
+end
+
+local function getFriendlyNPCs()
+    local targets = {"Select Friendly"}
+    local friendlyFolder = Workspace:FindFirstChild("NPCs") and Workspace.NPCs:FindFirstChild("Friendly")
+    if friendlyFolder then
+        for _, npc in ipairs(friendlyFolder:GetChildren()) do
+            table.insert(targets, npc.Name)
+        end
+    end
+    return targets
+end
+
+local function getAliveNPC(selectedStr)
+    if not selectedStr or selectedStr == "Select Target" then return nil end
+    local name, targetIndex = selectedStr:match("^(.-) #(%d+)$")
+    targetIndex = tonumber(targetIndex)
+    if not name then name = selectedStr end
+    
+    local hostileFolder = Workspace:FindFirstChild("NPCs") and Workspace.NPCs:FindFirstChild("Hostile")
+    if not hostileFolder then return nil end
+    
+    local count = 0
+    for _, child in ipairs(hostileFolder:GetChildren()) do
+        if child.Name == name then
+            count = count + 1
+            if not targetIndex or count == targetIndex then
+                local humanoid = child:FindFirstChildWhichIsA("Humanoid")
+                local rootPart = child:FindFirstChild("HumanoidRootPart") or child:FindFirstChildWhichIsA("BasePart")
+                if humanoid and humanoid.Health > 0 and rootPart then
+                    return child
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function refreshDropdownContents()
+    if TargetDropdown then TargetDropdown:SetValues(getTargets()) end
+    if FriendlyDropdown then FriendlyDropdown:SetValues(getFriendlyNPCs()) end
+end
+
+table.insert(Connections, Players.PlayerAdded:Connect(refreshDropdownContents))
+table.insert(Connections, Players.PlayerRemoving:Connect(refreshDropdownContents))
+table.insert(Connections, Workspace.ChildAdded:Connect(function(child)
+    if child.Name == "NPCs" then task.wait(1); refreshDropdownContents() end
+end))
+
+-- Click to Teleport Connection
+table.insert(Connections, Mouse.Button1Down:Connect(function()
+    if Flags.ClickTeleport then
+        local target = Mouse.Target
+        if target and target.Parent then
+            local humanoid = target.Parent:FindFirstChildWhichIsA("Humanoid")
+            local targetRoot = target.Parent:FindFirstChild("HumanoidRootPart")
+            if humanoid and targetRoot then
+                TeleportTo(targetRoot.CFrame, 0)
+            end
+        end
+    end
+end))
+
+-- /// INTERACT TAB ///
+
+Tabs.Interact:AddToggle("AutoInteractToggle", {
+    Title = "Auto-Collect Spawned Items", 
+    Default = false,
+    Callback = function(state)
+        Flags.AutoInteract = state
+        if Flags.AutoInteract then
+            task.spawn(function()
+                while Flags.AutoInteract and ScriptRunning do
+                    local spawnedItems = Workspace:FindFirstChild("Map") and Workspace.Map:FindFirstChild("Items") and Workspace.Map.Items:FindFirstChild("SpawnedItems")
+                    if spawnedItems then
+                        for _, item in ipairs(spawnedItems:GetChildren()) do
+                            if not Flags.AutoInteract then break end
+                            local prompt = item:FindFirstChildWhichIsA("ProximityPrompt", true)
+                            local targetPart = item:IsA("BasePart") and item or item:FindFirstChildWhichIsA("BasePart", true)
+                            if prompt and prompt.Enabled and targetPart then
+                                if TeleportTo(targetPart.CFrame) then
+                                    fireproximityprompt(prompt)
+                                    task.wait(0.15)
+                                end
+                            end
+                        end
+                    end
+                    task.wait(0.5)
+                end
+            end)
+        end
+    end 
+})
+
+Tabs.Interact:AddToggle("AutoMeteoriteToggle", {
+    Title = "Auto-Farm Meteorites", 
+    Default = false,
+    Callback = function(state)
+        Flags.AutoMeteorite = state
+        if Flags.AutoMeteorite then
+            task.spawn(function()
+                while Flags.AutoMeteorite and ScriptRunning do
+                    local meteorites = Workspace:FindFirstChild("MeteoriteSpawner") and Workspace.MeteoriteSpawner:FindFirstChild("Meteorites")
+                    if meteorites then
+                        for _, meteor in ipairs(meteorites:GetChildren()) do
+                            if not Flags.AutoMeteorite then break end
+                            local prompt = meteor:FindFirstChildWhichIsA("ProximityPrompt", true)
+                            local targetPart = meteor:IsA("BasePart") and meteor or meteor:FindFirstChildWhichIsA("BasePart", true)
+                            if prompt and prompt.Enabled and targetPart then
+                                if TeleportTo(targetPart.CFrame) then
+                                    while Flags.AutoMeteorite and meteor.Parent == meteorites and prompt and prompt.Enabled do
+                                        fireproximityprompt(prompt)
+                                        task.wait(0.1)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    task.wait(0.5)
+                end
+            end)
+        end
+    end 
+})
+
+Tabs.Interact:AddToggle("AutoChestToggle", {
+    Title = "Auto-Farm Chests", 
+    Default = false,
+    Callback = function(state)
+        Flags.AutoChest = state
+        if Flags.AutoChest then
+            task.spawn(function()
+                while Flags.AutoChest and ScriptRunning do
+                    local spawnedChests = Workspace:FindFirstChild("Chests") and Workspace.Chests:FindFirstChild("SpawnedChests")
+                    if spawnedChests then
+                        for _, chest in ipairs(spawnedChests:GetChildren()) do
+                            if not Flags.AutoChest then break end
+                            local woodTop = chest:FindFirstChild("WoodTop")
+                            if woodTop then
+                                local prompt = woodTop:FindFirstChildWhichIsA("ProximityPrompt")
+                                if prompt and prompt.Enabled then
+                                    if TeleportTo(woodTop.CFrame) then
+                                        fireproximityprompt(prompt)
+                                        task.wait(0.2)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    task.wait(0.5)
+                end
+            end)
+        end
+    end 
+})
+
+-- /// COMBAT TAB ///
+
+Tabs.Combat:AddDropdown("ModeDropdown", {
+    Title = "Target Mode",
+    Values = {"NPC", "Player"},
+    Multi = false,
+    Default = 1,
+    Callback = function(Value)
+        targetMode = Value
+        selectedTarget = "Select Target"
+        currentFarmNPC = nil
+        refreshDropdownContents()
+        if TargetDropdown then TargetDropdown:SetValue("Select Target") end
+    end
+})
+
+TargetDropdown = Tabs.Combat:AddDropdown("TargetDropdown", {
+    Title = "Select Target",
+    Values = getTargets(),
+    Multi = false,
+    Default = 1,
+    Callback = function(Value)
+        selectedTarget = Value
+        currentFarmNPC = nil 
+    end
+})
+
+Tabs.Combat:AddButton({
+    Title = "Refresh Target List",
+    Callback = function() refreshDropdownContents() end
+})
+
+Tabs.Combat:AddSlider("DistanceSlider", {
+    Title = "Teleport Distance (Behind)",
+    Default = 9,
+    Min = 0,
+    Max = 15,
+    Rounding = 1,
+    Callback = function(Value) farmDistance = Value end
+})
+
+Tabs.Combat:AddToggle("ReturnPosToggle", {
+    Title = "Return to Start Position on Stop",
+    Default = true,
+    Callback = function(state)
+        Flags.ReturnToLastPos = state
+    end
+})
+
+AutoFarmToggle = Tabs.Combat:AddToggle("AutoFarmToggle", {
+    Title = "Auto Farm",
+    Default = false,
+    Callback = function(state)
+        Flags.AutoFarm = state
+        
+        if Flags.AutoFarm then
+            if selectedTarget == "Select Target" or selectedTarget == nil then
+                Fluent:Notify({ Title = "Auto Farm Error", Content = "Please select a Target first!", Duration = 5 })
+                AutoFarmToggle:SetValue(false)
+                return
+            end
+
+            local character = LocalPlayer.Character
+            local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+            if rootPart then
+                lastPosition = rootPart.CFrame
+            end
+
+            farmHeartbeat = RunService.Heartbeat:Connect(function()
+                if not Flags.AutoFarm or not ScriptRunning then return end
+                local char = LocalPlayer.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if not root then return end
+                
+                local targetRoot = nil
+                local targetHumanoid = nil
+                
+                if targetMode == "Player" then
+                    local viaPlayer = Players:FindFirstChild(selectedTarget)
+                    if viaPlayer and viaPlayer.Character then
+                        targetHumanoid = viaPlayer.Character:FindFirstChildWhichIsA("Humanoid")
+                        targetRoot = viaPlayer.Character:FindFirstChild("HumanoidRootPart")
+                    end
+                elseif targetMode == "NPC" then
+                    local hostileFolder = Workspace:FindFirstChild("NPCs") and Workspace.NPCs:FindFirstChild("Hostile")
+                    local baseName = selectedTarget:match("^(.-) #(%d+)$") or selectedTarget
+                    
+                    if currentFarmNPC and currentFarmNPC.Parent == hostileFolder and currentFarmNPC.Name == baseName then
+                        local hum = currentFarmNPC:FindFirstChildWhichIsA("Humanoid")
+                        if not hum or hum.Health <= 0 then currentFarmNPC = nil end
+                    else
+                        currentFarmNPC = nil 
+                    end
+                    
+                    if not currentFarmNPC then currentFarmNPC = getAliveNPC(selectedTarget) end
+                    
+                    if currentFarmNPC then
+                        targetHumanoid = currentFarmNPC:FindFirstChildWhichIsA("Humanoid")
+                        targetRoot = currentFarmNPC:FindFirstChild("HumanoidRootPart") or currentFarmNPC:FindFirstChildWhichIsA("BasePart")
+                    end
+                end
+                
+                if targetRoot and targetHumanoid and targetHumanoid.Health > 0 then
+                    -- Direct CFrame setting during loops to prevent bouncing, tweening is only for singular travels
+                    local behindCFrame = targetRoot.CFrame * CFrame.new(0, 0, farmDistance)
+                    root.CFrame = CFrame.lookAt(behindCFrame.Position, targetRoot.Position)
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                end
+            end)
+            table.insert(Connections, farmHeartbeat)
+            
+        else
+            if farmHeartbeat then
+                farmHeartbeat:Disconnect()
+                farmHeartbeat = nil
+            end
+            
+            if lastPosition and ScriptRunning then
+                if Flags.ReturnToLastPos then
+                    local character = LocalPlayer.Character
+                    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+                    if rootPart then
+                        rootPart.CFrame = lastPosition
+                        rootPart.AssemblyLinearVelocity = Vector3.zero
+                        rootPart.AssemblyAngularVelocity = Vector3.zero
+                    end
+                end
+                lastPosition = nil
+            end
+        end
+    end
+})
+
+-- /// MOVEMENT TAB ///
+
+Tabs.Movement:AddDropdown("MethodDropdown", {
+    Title = "General Teleport Method",
+    Values = {"Instant", "Tween"},
+    Multi = false,
+    Default = 1,
+    Callback = function(Value)
+        Flags.TeleportMethod = Value
+    end
+})
+
+Tabs.Movement:AddSlider("TweenSlider", {
+    Title = "Tween Duration (If Selected)",
+    Default = 0.5,
+    Min = 0.05,
+    Max = 1,
+    Rounding = 2,
+    Callback = function(Value)
+        Flags.TweenSpeed = Value
+    end
+})
+
+Tabs.Movement:AddToggle("ClickTeleport", {
+    Title = "Click Humanoid to Teleport",
+    Default = false,
+    Callback = function(state)
+        Flags.ClickTeleport = state
+    end
+})
+
+FriendlyDropdown = Tabs.Movement:AddDropdown("FriendlyDropdown", {
+    Title = "Select Friendly NPC",
+    Values = getFriendlyNPCs(),
+    Multi = false,
+    Default = 1,
+    Callback = function(Value)
+        selectedFriendly = Value
+    end
+})
+
+Tabs.Movement:AddButton({
+    Title = "Teleport To Friendly",
+    Callback = function()
+        if selectedFriendly == "Select Friendly" or not selectedFriendly then return end
+        local friendlyFolder = Workspace:FindFirstChild("NPCs") and Workspace.NPCs:FindFirstChild("Friendly")
+        local npc = friendlyFolder and friendlyFolder:FindFirstChild(selectedFriendly)
+        local npcRoot = npc and (npc:FindFirstChild("HumanoidRootPart") or npc:FindFirstChildWhichIsA("BasePart"))
+        
+        if npcRoot then
+            -- Find position 1 stud in front of NPC (Assuming Roblox default -Z is Forward)
+            local frontCFrame = npcRoot.CFrame * CFrame.new(0, 0, -1)
+            local playerStandPos = frontCFrame.Position
+            local npcLookPos = npcRoot.Position
+            
+            -- Keep Y coordinates level so character doesn't pitch downwards or upwards
+            local targetCFrame = CFrame.lookAt(playerStandPos, Vector3.new(npcLookPos.X, playerStandPos.Y, npcLookPos.Z))
+            TeleportTo(targetCFrame, 0)
+        else
+            Fluent:Notify({Title = "Error", Content = "Friendly NPC not found!", Duration = 3})
+        end
+    end
+})
+
+-- /// SETTINGS TAB ///
+
+Tabs.Settings:AddInput("AutoExecUrl", {
+    Title = "Auto Execute Script URL",
+    Default = "",
+    Placeholder = "Paste raw Loadstring URL here",
+    Numeric = false,
+    Finished = false,
+    Callback = function(Value)
+        autoExecuteUrl = Value
+    end
+})
+
+Tabs.Settings:AddToggle("AutoExecToggle", {
+    Title = "Auto Execute on Place Teleport",
+    Default = false,
+    Callback = function(state)
+        Flags.AutoExecute = state
+        if state then
+            local qot = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+            if qot then
+                if autoExecuteUrl and autoExecuteUrl ~= "" then
+                    qot('loadstring(game:HttpGet("' .. autoExecuteUrl .. '"))()')
+                    Fluent:Notify({Title = "Auto Execute", Content = "Script queued for next place teleport.", Duration = 3})
+                else
+                    Fluent:Notify({Title = "Warning", Content = "Please enter a valid Script URL in the input above.", Duration = 4})
+                end
+            else
+                Fluent:Notify({Title = "Error", Content = "Your executor does not support queue_on_teleport.", Duration = 4})
+            end
+        end
+    end
+})
+
+Tabs.Settings:AddDropdown("ThemeDropdown", {
+    Title = "Theme",
+    Values = {"Darker", "Dark", "Light", "Aqua", "Amethyst", "Rose"},
+    Default = "Dark",
+    Callback = function(Value) Fluent:SetTheme(Value) end
+})
+
+Tabs.Settings:AddKeybind("MinimizeKeybind", {
+    Title = "Minimize UI Keybind",
+    Mode = "Toggle", 
+    Default = "Delete", 
+    Callback = function(Value) end,
+    ChangedCallback = function(NewKey)
+        Window.MinimizeKey = NewKey
+        Fluent:Notify({Title = "Keybind Changed", Content = "UI Toggle set to " .. tostring(NewKey.Name), Duration = 3})
+    end
+})
+
+Tabs.Settings:AddButton({
+    Title = "Unload Hub",
+    Callback = function()
+        ScriptRunning = false
+        for flagName, _ in pairs(Flags) do Flags[flagName] = false end
+        if AutoFarmToggle then AutoFarmToggle:SetValue(false) end
+        DisconnectAll()
+        task.wait(0.2)
+        Window:Destroy()
+    end
+})
+
+Window:SelectTab(1)
